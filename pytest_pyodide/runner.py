@@ -477,6 +477,11 @@ class SeleniumChromeRunner(_SeleniumBaseRunner):
             options.add_argument("--enable-experimental-webassembly-features")
         for flag in self._config.get_flags("chrome"):
             options.add_argument(flag)
+        # Enable capture of the browser console log so callers can use
+        # ``driver.get_log("browser")`` to surface errors that Chrome
+        # reports to the console but not through WebDriver (e.g. worker
+        # script-load MIME-type rejections).
+        options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
         return Chrome(options=options)
 
     def collect_garbage(self):
@@ -563,6 +568,9 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
         # helper (``self.__workerCall``) that returns a promise resolved
         # with the worker's response for a given message id.
         worker_url = f"{self.base_url}/{self.WORKER_FILE}"
+        # The worker imports "./pyodide.mjs" relative to itself, so this is
+        # the URL Chrome will try to fetch for that import.
+        pyodide_mjs_url = f"{self.base_url}/pyodide.mjs"
         bootstrap = f"""
             const worker = new Worker({worker_url!r}, {{ type: 'module' }});
             self.__worker = worker;
@@ -575,6 +583,43 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
             // and (b) we serialize the ErrorEvent properly instead of letting
             // it stringify to the useless `"[object Event]"`.
             self.__workerFatal = null;
+            // Diagnostic: probe the worker script URL and the pyodide.mjs URL
+            // via fetch() in parallel. Module worker scripts and their imports
+            // must be served with a JavaScript MIME type; a 404 or a wrong
+            // Content-Type will cause Chrome to fire a bare `error` event on
+            // the Worker with all fields redacted. Record the results so we
+            // can attach them to any fatal we surface.
+            self.__workerProbes = null;
+            const probeUrl = async (url) => {{
+                try {{
+                    const res = await fetch(url, {{ method: "GET" }});
+                    const ct = res.headers.get("content-type") || "";
+                    // Read a little of the body so we can spot HTML error pages
+                    // that were served with a 200 status (e.g. SPA fallbacks).
+                    let sniff = "";
+                    try {{
+                        const text = await res.clone().text();
+                        sniff = text.slice(0, 120).replace(/\\s+/g, " ");
+                    }} catch (_e) {{ /* ignore */ }}
+                    return {{ url, status: res.status, contentType: ct, sniff }};
+                }} catch (e) {{
+                    return {{ url, error: (e && e.message) || String(e) }};
+                }}
+            }};
+            self.__workerProbesReady = Promise.all([
+                probeUrl({worker_url!r}),
+                probeUrl({pyodide_mjs_url!r}),
+            ]).then((probes) => {{
+                self.__workerProbes = probes;
+                return probes;
+            }});
+            const formatProbes = (probes) => {{
+                if (!probes) return "probes=pending";
+                return probes.map((p) => {{
+                    if (p.error) return `${{p.url}}: fetch-error=${{p.error}}`;
+                    return `${{p.url}}: status=${{p.status}} ct=${{p.contentType}} sniff=${{JSON.stringify(p.sniff)}}`;
+                }}).join(" ;; ");
+            }};
             const serializeWorkerError = (ev) => {{
                 // `ev` may be an ErrorEvent, a MessageEvent (for
                 // `messageerror`), or a bare Event. Pull out whatever useful
@@ -603,25 +648,34 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
                     // so at least the caller knows what kind of event.
                     parts.push(`ev=${{Object.prototype.toString.call(ev)}}`);
                 }}
+                parts.push(`probes={{${{formatProbes(self.__workerProbes)}}}}`);
                 return `Worker ${{type || "error"}}: ${{parts.join(" | ")}}`;
             }};
             const onFatal = (ev) => {{
-                const description = serializeWorkerError(ev);
-                // Also log to the browser console so it appears in
-                // `driver.get_log('browser')` / CI artifacts.
-                console.error("pytest_pyodide worker fatal:", description, ev);
-                const err = {{
-                    ok: false,
-                    error: description,
-                    message: description,
-                    stack: (ev && ev.error && ev.error.stack) || "",
-                }};
-                self.__workerFatal = err;
-                // Reject every currently-pending call.
-                for (const [id, entry] of self.__workerPending) {{
-                    self.__workerPending.delete(id);
-                    entry({{ id, ...err }});
-                }}
+                // If probes aren't done yet, wait briefly so we can include
+                // their results in the error; if they're already done, this
+                // resolves immediately.
+                Promise.race([
+                    self.__workerProbesReady,
+                    new Promise((r) => setTimeout(r, 2000)),
+                ]).finally(() => {{
+                    const description = serializeWorkerError(ev);
+                    // Also log to the browser console so it appears in
+                    // `driver.get_log('browser')` / CI artifacts.
+                    console.error("pytest_pyodide worker fatal:", description, ev);
+                    const err = {{
+                        ok: false,
+                        error: description,
+                        message: description,
+                        stack: (ev && ev.error && ev.error.stack) || "",
+                    }};
+                    self.__workerFatal = err;
+                    // Reject every currently-pending call.
+                    for (const [id, entry] of self.__workerPending) {{
+                        self.__workerPending.delete(id);
+                        entry({{ id, ...err }});
+                    }}
+                }});
             }};
             worker.addEventListener("error", onFatal);
             worker.addEventListener("messageerror", onFatal);
@@ -648,6 +702,29 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
         # Run the bootstrap on the main page itself
         super().run_js_inner(bootstrap, "")
 
+    def _collect_browser_log(self) -> str:
+        """Best-effort drain of the browser console log.
+
+        Worker script-load failures frequently produce a redacted `error`
+        event (all fields empty) but log a useful diagnostic like
+        "Failed to load module script: Expected a JavaScript-or-Wasm module
+        script but the server responded with a MIME type of ..." to the
+        browser console. When our worker RPC fails we attach whatever's
+        there so the cause isn't lost.
+        """
+        try:
+            entries = self.driver.get_log("browser")
+        except Exception as e:  # pragma: no cover - driver-specific
+            return f"(failed to get browser log: {e!r})"
+        if not entries:
+            return "(browser log empty)"
+        lines = []
+        for entry in entries:
+            level = entry.get("level", "?")
+            msg = entry.get("message", "")
+            lines.append(f"[{level}] {msg}")
+        return "\n".join(lines)
+
     def run_js_inner(self, code, check_code):
         # Run ``code`` inside the worker; ``check_code`` must also run
         # inside the worker because it references ``globalThis.pyodide``
@@ -669,8 +746,20 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
             __e.stack = __res.stack;
             throw __e;
         """
-        # check_code here is run on the page. We already handled it in worker_body
-        return super().run_js_inner(wrapper, "")
+        try:
+            # check_code here is run on the page. We already handled it
+            # in worker_body.
+            return super().run_js_inner(wrapper, "")
+        except JavascriptException as e:
+            browser_log = self._collect_browser_log()
+            # Re-raise a new exception with the browser log appended to
+            # the message so it shows up in pytest output.
+            augmented_msg = (
+                f"{e.msg}\n"
+                f"---- browser console log ----\n{browser_log}\n"
+                f"-----------------------------"
+            )
+            raise JavascriptException(augmented_msg, e.stack) from e
 
 
 class BrowserWorkerChromeRunner(_BrowserWorkerRunnerMixin, SeleniumChromeRunner):
