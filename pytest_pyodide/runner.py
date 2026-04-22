@@ -568,6 +568,63 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
             self.__worker = worker;
             self.__workerPending = new Map();
             self.__workerNextId = 1;
+            // Latched fatal-error state. A Worker `error` event is typically
+            // fatal (script-load failure, uncaught top-level exception, or
+            // `messageerror`). Capture it so that (a) any *future* call via
+            // __workerCall rejects immediately with a useful description,
+            // and (b) we serialize the ErrorEvent properly instead of letting
+            // it stringify to the useless `"[object Event]"`.
+            self.__workerFatal = null;
+            const serializeWorkerError = (ev) => {{
+                // `ev` may be an ErrorEvent, a MessageEvent (for
+                // `messageerror`), or a bare Event. Pull out whatever useful
+                // fields exist without relying on `??`/`||` against empty
+                // strings (which are common and not informative).
+                const parts = [];
+                const type = ev && ev.type;
+                if (type) parts.push(`type=${{type}}`);
+                const msg = ev && ev.message;
+                if (msg) parts.push(`message=${{msg}}`);
+                const filename = ev && ev.filename;
+                if (filename) parts.push(`filename=${{filename}}`);
+                const lineno = ev && ev.lineno;
+                if (lineno) parts.push(`lineno=${{lineno}}`);
+                const colno = ev && ev.colno;
+                if (colno) parts.push(`colno=${{colno}}`);
+                const inner = ev && ev.error;
+                if (inner) {{
+                    const innerMsg = inner.message || String(inner);
+                    if (innerMsg) parts.push(`error=${{innerMsg}}`);
+                    if (inner.stack) parts.push(`errorStack=${{inner.stack}}`);
+                }}
+                if (parts.length === 0) {{
+                    // Last-resort: ErrorEvent has no own enumerable props,
+                    // so JSON.stringify returns "{{}}". Fall back to a tag
+                    // so at least the caller knows what kind of event.
+                    parts.push(`ev=${{Object.prototype.toString.call(ev)}}`);
+                }}
+                return `Worker ${{type || "error"}}: ${{parts.join(" | ")}}`;
+            }};
+            const onFatal = (ev) => {{
+                const description = serializeWorkerError(ev);
+                // Also log to the browser console so it appears in
+                // `driver.get_log('browser')` / CI artifacts.
+                console.error("pytest_pyodide worker fatal:", description, ev);
+                const err = {{
+                    ok: false,
+                    error: description,
+                    message: description,
+                    stack: (ev && ev.error && ev.error.stack) || "",
+                }};
+                self.__workerFatal = err;
+                // Reject every currently-pending call.
+                for (const [id, entry] of self.__workerPending) {{
+                    self.__workerPending.delete(id);
+                    entry({{ id, ...err }});
+                }}
+            }};
+            worker.addEventListener("error", onFatal);
+            worker.addEventListener("messageerror", onFatal);
             worker.onmessage = (ev) => {{
                 const {{ id }} = ev.data ?? {{}};
                 const entry = self.__workerPending.get(id);
@@ -575,22 +632,12 @@ class _BrowserWorkerRunnerMixin(_BrowserBaseRunner):
                 self.__workerPending.delete(id);
                 entry(ev.data);
             }};
-            worker.onerror = (ev) => {{
-                // Reject every pending call with the worker error.
-                const err = {{
-                    ok: false,
-                    error: ev.message ?? String(ev),
-                    message: ev.message ?? "",
-                    stack: ev.filename
-                        ? `${{ev.filename}}:${{ev.lineno}}:${{ev.colno}}`
-                        : "",
-                }};
-                for (const [id, entry] of self.__workerPending) {{
-                    self.__workerPending.delete(id);
-                    entry({{ id, ...err }});
-                }}
-            }};
             self.__workerCall = function (code) {{
+                // If the worker has already fatally errored, don't even
+                // try to postMessage -- just reject with the recorded error.
+                if (self.__workerFatal) {{
+                    return Promise.resolve({{ id: -1, ...self.__workerFatal }});
+                }}
                 const id = self.__workerNextId++;
                 return new Promise((resolve) => {{
                     self.__workerPending.set(id, resolve);
